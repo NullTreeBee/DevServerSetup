@@ -1,0 +1,416 @@
+#!/bin/zsh
+
+# Turn a Mac into a temporary Ollama + Open WebUI Computer server.
+# Usage: server-mode {install|on|off|status}
+
+set -u
+
+readonly PROGRAM_NAME="server-mode"
+readonly CPTR_HOST="${CPTR_HOST:-127.0.0.1}"
+readonly CPTR_PORT="${CPTR_PORT:-8000}"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/server-mode"
+readonly COMPUTER_PID_FILE="$STATE_DIR/computer.pid"
+readonly CAFFEINATE_PID_FILE="$STATE_DIR/caffeinate.pid"
+readonly OLLAMA_PID_FILE="$STATE_DIR/ollama.pid"
+readonly COMPUTER_LOG="$STATE_DIR/computer.log"
+readonly OLLAMA_LOG="$STATE_DIR/ollama.log"
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+say() {
+  print -r -- "[$PROGRAM_NAME] $*"
+}
+
+warn() {
+  print -ru2 -- "[$PROGRAM_NAME] Warning: $*"
+}
+
+die() {
+  print -ru2 -- "[$PROGRAM_NAME] Error: $*"
+  exit 1
+}
+
+require_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "This script currently supports macOS only."
+}
+
+load_homebrew() {
+  local candidate
+
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [[ -x "$candidate" ]]; then
+      eval "$("$candidate" shellenv)"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_homebrew() {
+  if command -v brew >/dev/null 2>&1 || load_homebrew; then
+    return 0
+  fi
+
+  say "Homebrew is missing; installing it now."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    || die "Homebrew installation failed."
+
+  load_homebrew || die "Homebrew installed, but its command could not be found. Open a new Terminal and try again."
+}
+
+find_ollama() {
+  if command -v ollama >/dev/null 2>&1; then
+    command -v ollama
+    return 0
+  fi
+
+  if [[ -x /Applications/Ollama.app/Contents/Resources/ollama ]]; then
+    print -r -- /Applications/Ollama.app/Contents/Resources/ollama
+    return 0
+  fi
+
+  return 1
+}
+
+find_tailscale() {
+  local candidate
+
+  for candidate in \
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+    /Applications/Tailscale.app/Contents/MacOS/tailscale; do
+    if [[ -x "$candidate" ]]; then
+      print -r -- "$candidate"
+      return 0
+    fi
+  done
+
+  if command -v tailscale >/dev/null 2>&1; then
+    command -v tailscale
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ensure_homebrew
+  say "Installing uv."
+  brew install uv || die "Could not install uv."
+}
+
+ensure_computer() {
+  if command -v cptr >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ensure_uv
+  say "Installing Open WebUI Computer."
+  uv tool install cptr || die "Could not install Open WebUI Computer."
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v cptr >/dev/null 2>&1 || die "Computer installed, but cptr was not found in $HOME/.local/bin."
+}
+
+ensure_ollama() {
+  if find_ollama >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ensure_homebrew
+  say "Installing Ollama."
+  brew install ollama || die "Could not install Ollama."
+  find_ollama >/dev/null 2>&1 || die "Ollama installed, but its command could not be found."
+}
+
+ensure_tailscale() {
+  if find_tailscale >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ensure_homebrew
+  say "Installing Tailscale. macOS may ask you to approve its system extension."
+  brew install --cask tailscale-app || die "Could not install Tailscale."
+  open -gj -a Tailscale >/dev/null 2>&1 || true
+  find_tailscale >/dev/null 2>&1 || die "Tailscale installed, but its command could not be found. Open Tailscale once and try again."
+}
+
+ensure_dependencies() {
+  ensure_uv
+  ensure_computer
+  ensure_ollama
+  ensure_tailscale
+}
+
+pid_is_running() {
+  local pid_file="$1"
+  local pid
+
+  [[ -f "$pid_file" ]] || return 1
+  pid="$(<"$pid_file")"
+  [[ "$pid" == <-> ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+stop_pid_file() {
+  local label="$1"
+  local pid_file="$2"
+  local expected_process="$3"
+  local pid
+  local process_command
+  local attempt
+
+  if ! pid_is_running "$pid_file"; then
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  pid="$(<"$pid_file")"
+  process_command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [[ "$process_command" != *"$expected_process"* ]]; then
+    warn "Ignoring stale $label PID file; PID $pid belongs to another process."
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  say "Stopping $label."
+  kill "$pid" >/dev/null 2>&1 || true
+
+  for attempt in {1..20}; do
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    warn "$label did not stop cleanly; forcing it to stop."
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$pid_file"
+}
+
+wait_for_url() {
+  local url="$1"
+  local attempts="${2:-60}"
+  local attempt
+
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
+ensure_tailscale_connected() {
+  local tailscale_bin="$1"
+  local attempt
+
+  if "$tailscale_bin" ip -4 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  open -gj -a Tailscale >/dev/null 2>&1 || true
+  say "Waiting for Tailscale to connect."
+
+  for attempt in {1..10}; do
+    if "$tailscale_bin" ip -4 >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  die "Open Tailscale, sign in, then run '$PROGRAM_NAME on' again."
+}
+
+start_caffeinate() {
+  if pid_is_running "$CAFFEINATE_PID_FILE"; then
+    say "AC-power sleep prevention is already active."
+    return 0
+  fi
+
+  nohup caffeinate -s </dev/null >"$STATE_DIR/caffeinate.log" 2>&1 &
+  print -r -- "$!" >"$CAFFEINATE_PID_FILE"
+
+  if pmset -g batt | grep -q "AC Power"; then
+    say "The Mac will stay awake while plugged in; the display may still turn off."
+  else
+    warn "The Mac is on battery, so it can still sleep. Plug it in for unattended use."
+  fi
+}
+
+start_ollama() {
+  local ollama_bin
+
+  if curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    say "Ollama is already running."
+    return 0
+  fi
+
+  ollama_bin="$(find_ollama)" || die "Ollama is not installed."
+  say "Starting Ollama."
+  nohup env OLLAMA_HOST=127.0.0.1:11434 "$ollama_bin" serve </dev/null >>"$OLLAMA_LOG" 2>&1 &
+  print -r -- "$!" >"$OLLAMA_PID_FILE"
+
+  if ! wait_for_url http://127.0.0.1:11434/api/tags 30; then
+    stop_pid_file "Ollama" "$OLLAMA_PID_FILE" "ollama"
+    die "Ollama did not start. See $OLLAMA_LOG"
+  fi
+}
+
+start_computer() {
+  local cptr_bin
+
+  if curl -fsS --max-time 2 "http://$CPTR_HOST:$CPTR_PORT" >/dev/null 2>&1; then
+    say "Computer is already running on port $CPTR_PORT."
+    return 0
+  fi
+
+  cptr_bin="$(command -v cptr)" || die "Open WebUI Computer is not installed."
+  say "Starting Open WebUI Computer."
+  nohup "$cptr_bin" run --headless --host "$CPTR_HOST" --port "$CPTR_PORT" \
+    </dev/null >>"$COMPUTER_LOG" 2>&1 &
+  print -r -- "$!" >"$COMPUTER_PID_FILE"
+
+  if ! wait_for_url "http://$CPTR_HOST:$CPTR_PORT" 60; then
+    stop_pid_file "Open WebUI Computer" "$COMPUTER_PID_FILE" "cptr"
+    die "Computer did not start. See $COMPUTER_LOG"
+  fi
+}
+
+install_command() {
+  local install_dir="$HOME/.local/bin"
+  local destination="$install_dir/$PROGRAM_NAME"
+  local source_path="${0:A}"
+  local profile="$HOME/.zprofile"
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
+
+  require_macos
+  ensure_dependencies
+  mkdir -p "$install_dir"
+
+  if [[ "$source_path" != "$destination" ]]; then
+    /usr/bin/install -m 755 "$source_path" "$destination"
+  else
+    chmod 755 "$destination"
+  fi
+
+  if ! grep -Fqx "$path_line" "$profile" 2>/dev/null; then
+    {
+      print
+      print -r -- "# Added by DevServerSetup"
+      print -r -- "$path_line"
+    } >>"$profile"
+  fi
+
+  say "Installed $destination"
+  say "Open a new Terminal, then run: $PROGRAM_NAME on"
+}
+
+turn_on() {
+  local tailscale_bin
+  local setup_url
+
+  require_macos
+  ensure_dependencies
+  tailscale_bin="$(find_tailscale)" || die "Tailscale is not installed."
+  ensure_tailscale_connected "$tailscale_bin"
+
+  start_caffeinate
+  start_ollama
+  start_computer
+
+  say "Enabling private phone access."
+  "$tailscale_bin" serve --bg "localhost:$CPTR_PORT" \
+    || die "Tailscale could not expose Computer."
+
+  say "Server mode is on."
+  "$tailscale_bin" serve status || true
+
+  setup_url="$(grep -Eo 'http://[^ ]+/\?token=[[:xdigit:]]+' "$COMPUTER_LOG" 2>/dev/null | tail -1)"
+  if [[ -n "$setup_url" ]]; then
+    say "First Computer setup URL (open this on the Mac): $setup_url"
+  fi
+}
+
+turn_off() {
+  local tailscale_bin
+
+  require_macos
+  tailscale_bin="$(find_tailscale 2>/dev/null || true)"
+
+  if [[ -n "$tailscale_bin" ]]; then
+    say "Removing remote access."
+    "$tailscale_bin" serve --https=443 off >/dev/null 2>&1 \
+      || warn "Tailscale remote access could not be disabled."
+  fi
+
+  stop_pid_file "Open WebUI Computer" "$COMPUTER_PID_FILE" "cptr"
+  stop_pid_file "Ollama" "$OLLAMA_PID_FILE" "ollama"
+  stop_pid_file "AC-power sleep prevention" "$CAFFEINATE_PID_FILE" "caffeinate"
+  say "Server mode is off; normal sleep behaviour is restored."
+}
+
+show_status() {
+  local tailscale_bin
+
+  if curl -fsS --max-time 2 "http://$CPTR_HOST:$CPTR_PORT" >/dev/null 2>&1; then
+    say "Computer: running at http://$CPTR_HOST:$CPTR_PORT"
+  else
+    say "Computer: stopped"
+  fi
+
+  if curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    say "Ollama: running"
+  else
+    say "Ollama: stopped"
+  fi
+
+  if pid_is_running "$CAFFEINATE_PID_FILE"; then
+    say "AC-power sleep prevention: active"
+  else
+    say "AC-power sleep prevention: inactive"
+  fi
+
+  tailscale_bin="$(find_tailscale 2>/dev/null || true)"
+  if [[ -n "$tailscale_bin" ]]; then
+    "$tailscale_bin" serve status 2>/dev/null || say "Remote access: inactive"
+  else
+    say "Tailscale: not installed"
+  fi
+}
+
+usage() {
+  print -r -- "Usage: $PROGRAM_NAME {install|on|off|status}"
+  print -r -- "  install  Install missing dependencies and add server-mode to ~/.local/bin"
+  print -r -- "  on       Install anything missing and start server mode"
+  print -r -- "  off      Stop services started by this script and restore normal sleep"
+  print -r -- "  status   Show the current server state"
+}
+
+case "${1:-}" in
+  install)
+    install_command
+    ;;
+  on)
+    turn_on
+    ;;
+  off)
+    turn_off
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
